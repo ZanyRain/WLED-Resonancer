@@ -1,5 +1,10 @@
 #include "wled.h"
 
+// A usermod may take over frames of a serial protocol the core only parses (see
+// usermods/Resonancer); the core itself stays free of usermod types.
+static SerialFrameSink serialFrameSink = nullptr;
+void setSerialFrameSink(SerialFrameSink sink) { serialFrameSink = sink; }
+
 // forward declarations
 static void sendBytes();
 
@@ -20,6 +25,12 @@ enum class AdaState {
   TPM2_Header_Type,
   TPM2_Header_CountHi,
   TPM2_Header_CountLo,
+  LumaFlow_Head2,
+  LumaFlow_Length,
+  LumaFlow_Cmd,
+  LumaFlow_Data,
+  LumaFlow_Checksum,
+  LumaFlow_Tail
 };
 
 static uint16_t currentBaud = 1152; //default baudrate 115200 (divided by 100)
@@ -80,6 +91,12 @@ void handleSerial()
   static byte check = 0x00;
   static byte red   = 0x00;
   static byte green = 0x00;
+  static byte blue  = 0x00;
+  static uint8_t lf_length = 0;
+  static uint8_t lf_cmd = 0;
+  static uint8_t lf_checksum = 0;
+  static uint8_t lf_idx = 0;
+  static uint8_t lf_buf[128];
 
   while (Serial.available() > 0)
   {
@@ -99,6 +116,7 @@ void handleSerial()
         else if (next == 0xB5) { updateBaudRate( 921600); }
         else if (next == 0xB6) { updateBaudRate(1000000); }
         else if (next == 0xB7) { updateBaudRate(1500000); }
+        else if (next == 0xEB) { state = AdaState::LumaFlow_Head2; }
         else if (next == 'l')  { sendJSON(); } // Send LED data as JSON Array
         else if (next == 'L')  { sendBytes(); } // Send LED data as TPM2 Data Packet
         else if (next == 'o')  { continuousSendLED = false; } // Disable Continuous Serial Streaming
@@ -174,7 +192,7 @@ void handleSerial()
         state = AdaState::Data_Blue;
         break;
       case AdaState::Data_Blue:
-        byte blue  = next;
+        blue  = next;
         if (!realtimeOverride) setRealtimePixel(pixel++, red, green, blue, 0);
         if (--count > 0) state = AdaState::Data_Red;
         else {
@@ -184,6 +202,50 @@ void handleSerial()
           state = AdaState::Header_A;
         }
         break;
+      case AdaState::LumaFlow_Head2:
+        if (next == 0x90) {
+            state = AdaState::LumaFlow_Length;
+        } else {
+            state = AdaState::Header_A;
+        }
+        break;
+      case AdaState::LumaFlow_Length:
+        if (next > 0 && next <= 128) {
+            lf_length = next;
+            lf_checksum = next;
+            lf_idx = 0;
+            state = AdaState::LumaFlow_Cmd;
+        } else {
+            state = AdaState::Header_A;
+        }
+        break;
+      case AdaState::LumaFlow_Cmd:
+        lf_cmd = next;
+        lf_checksum += next;
+        state = (lf_length > 1) ? AdaState::LumaFlow_Data : AdaState::LumaFlow_Checksum;
+        break;
+      case AdaState::LumaFlow_Data:
+        lf_buf[lf_idx++] = next;
+        lf_checksum += next;
+        if (lf_idx == lf_length - 1) {
+            state = AdaState::LumaFlow_Checksum;
+        }
+        break;
+      case AdaState::LumaFlow_Checksum:
+        if ((lf_checksum & 0xFF) == next) {
+            state = AdaState::LumaFlow_Tail;
+        } else {
+            state = AdaState::Header_A; // checksum mismatch, drop the frame
+        }
+        break;
+      case AdaState::LumaFlow_Tail:
+        // Hand the binary payload to a registered sink. The frame is already
+        // validated (header, length, checksum), so no JSON or hex conversion is
+        // needed on this path.
+        if (next == 0xED && serialFrameSink != nullptr) {
+          serialFrameSink(lf_cmd, lf_buf, lf_idx);
+        }
+        state = AdaState::Header_A; // a frame is complete either way
     }
 
     // All other received bytes will disable Continuous Serial Streaming

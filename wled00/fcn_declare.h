@@ -589,6 +589,13 @@ uint32_t sqrt32_bw(uint32_t x);
 void handleSerial();
 void updateBaudRate(uint32_t rate);
 
+// Serial frame sink: a usermod can register a handler for a frame that one of the
+// serial parsers has already validated (see usermods/Resonancer for LumaFlow).
+// Without a registered sink such a frame is dropped, so builds that do not include
+// the usermod are unaffected.
+typedef bool (*SerialFrameSink)(uint8_t cmd, const uint8_t* payload, uint8_t payloadLen);
+void setSerialFrameSink(SerialFrameSink sink);
+
 //wled_server.cpp
 void initServer();
 void serveMessage(AsyncWebServerRequest* request, uint16_t code, const String& headl, const String& subl="", byte optionT=255);
